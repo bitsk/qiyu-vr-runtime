@@ -1,0 +1,40 @@
+{
+  "repository": "https://gitlab.freedesktop.org/monado/monado.git",
+  "commit": "d0e85c8a4630b7da99ffec190b9f50956bc11969",
+  "patch_sha256": "049939d1fe4e5a1ab45c165002575af75e403284cb610093191da4f83bf1343d",
+  "external_headers": {
+    "src/xrt/targets/common/a081_tracking_wire.h": [
+      "qiyu-head-tracking",
+      "include/qiyu/head/a081_tracking_wire.h"
+    ],
+    "src/xrt/targets/common/a081_tracking_client.h": [
+      "qiyu-head-tracking",
+      "include/qiyu/head/a081_tracking_client.h"
+    ],
+    "src/xrt/targets/common/a081_qvr_pose.h": [
+      "qiyu-head-tracking",
+      "include/qiyu/head/a081_qvr_pose.h"
+    ],
+    "src/xrt/state_trackers/steamvr_drv/a081_controller_pose_wire.h": [
+      "qiyu-controller-tracking",
+      "include/qiyu/controller/a081_controller_pose_wire.h"
+    ]
+  },
+  "changed_files_sha256": {
+    "src/xrt/compositor/main/comp_renderer.c": "43575629274404264983387a884288c67bdc8fb5d49c385a4b3e5ae08069b755",
+    "src/xrt/compositor/main/comp_settings.c": "dcb4a5d519e3c831aa16a3abfcade79eac90fa73fe9ff466909e025cd544acac",
+    "src/xrt/state_trackers/steamvr_drv/a081_controller_openvr.hpp": "c7c65d78bf9cbeca89eeb3cc49b321d46e54c44d1a79a64cb0622a1bc007a0dd",
+    "src/xrt/state_trackers/steamvr_drv/a081_controller_pose_wire.h": "2f37564580cd456d0e0700e244a43d80425a827d3ea1dd4e9e68606987fa9526",
+    "src/xrt/state_trackers/steamvr_drv/ovrd_driver.cpp": "ab51c4ec31feffad28a33c1fce360b763865b431f186cbda5c9b21796d5caaec",
+    "src/xrt/targets/common/CMakeLists.txt": "53da84e9b83522af5c6408ac004543b2f36f7eea5bb9f318f8d35254d8a589da",
+    "src/xrt/targets/common/a081_device.c": "52f0946f4725011941f6db16f68fdbcdb5d1c17dc6361db2fcec576fa39cbbe6",
+    "src/xrt/targets/common/a081_optics.h": "9507b78afbe9d8ce6d5c291cec6615fcef614a355423cd526dfa6330032ae7a0",
+    "src/xrt/targets/common/a081_qvr_pose.h": "1926765f35ed2317188c91384119322516e049e92142164d1e9e0066c784b5a9",
+    "src/xrt/targets/common/a081_tracking_client.h": "83356b9167f8a6ba7dcefe7a34a9404c38159ce71e46e6739147670fdfdbec8e",
+    "src/xrt/targets/common/a081_tracking_wire.h": "a59d94185675de3196f63ac0d682cb6f26a0d283e2615ddda3cab5671bc36062",
+    "src/xrt/targets/common/target_builder_a081.c": "2a74cd65e829e61c6b222845ed6bde9d327fc873d6d4c7bf1641e43bfccdb2a9",
+    "src/xrt/targets/common/target_lists.c": "8eaa4d90e7b9393b47fa4adffdb5728401eaf0d4665208ae848a72274869b238",
+    "src/xrt/targets/steamvr_drv/CMakeLists.txt": "a68bf55562e42f7bd81dab5f1ec363c530488fdb510aedc13de69df55a0d3906"
+  },
+  "scope": "A081 Linux SteamVR provider with stock optics and controller prediction; source migration only"
+}

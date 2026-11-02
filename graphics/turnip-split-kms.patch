@@ -1,0 +1,347 @@
+--- a/src/freedreno/vulkan/tu_device.h
++++ b/src/freedreno/vulkan/tu_device.h
+@@ -103,6 +103,7 @@
+    int64_t local_major;
+    int64_t local_minor;
+    int master_fd;
++   bool a081_split_kms;
+    bool has_master;
+    int64_t master_major;
+    int64_t master_minor;
+--- a/src/freedreno/vulkan/tu_knl.cc
++++ b/src/freedreno/vulkan/tu_knl.cc
+@@ -26,6 +26,10 @@
+ #include "tu_knl.h"
+ #include "tu_queue.h"
+ #include "tu_rmv.h"
++
++#ifdef HAVE_LIBDRM
++#include "tu_a081_display.h"
++#endif
+ 
+ VkResult
+ tu_bo_init_new_explicit_iova(struct tu_device *dev,
+@@ -391,6 +395,7 @@
+    drmVersionPtr version;
+    int fd;
+    int master_fd = -1;
++   const char *a081_kms_path = debug_get_option("TU_A081_KMS_DEVICE", NULL);
+ 
+    fd = open(path, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+@@ -436,7 +441,24 @@
+    assert(device);
+ 
+    if (instance->vk.enabled_extensions.KHR_display) {
+-      master_fd = open(primary_path, O_RDWR | O_CLOEXEC);
++      if (a081_kms_path) {
++         if (strcmp(version->name, "msm")) {
++            result = vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
++                              "TU_A081_KMS_DEVICE requires the MSM GPU backend");
++            goto out;
++         }
++         master_fd = tu_a081_display_open(a081_kms_path);
++         if (master_fd < 0) {
++            result = vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
++                              "A081 KMS device %s is unavailable: %s",
++                              a081_kms_path, strerror(errno));
++            goto out;
++         }
++         device->a081_split_kms = true;
++         mesa_logi("A081 direct display: GPU %s, KMS %s", path, a081_kms_path);
++      } else {
++         master_fd = open(primary_path, O_RDWR | O_CLOEXEC);
++      }
+    }
+ 
+    device->master_fd = master_fd;
+@@ -447,7 +469,7 @@
+ 
+    struct stat st;
+ 
+-   if (stat(primary_path, &st) == 0) {
++   if ((device->a081_split_kms ? fstat(master_fd, &st) : stat(primary_path, &st)) == 0) {
+       device->has_master = true;
+       device->master_major = major(st.st_rdev);
+       device->master_minor = minor(st.st_rdev);
+--- a/src/freedreno/vulkan/tu_wsi.cc
++++ b/src/freedreno/vulkan/tu_wsi.cc
+@@ -15,6 +15,10 @@
+ 
+ #include "tu_device.h"
+ 
++#ifdef HAVE_LIBDRM
++#include "tu_a081_display.h"
++#endif
++
+ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+ tu_wsi_proc_addr(VkPhysicalDevice physicalDevice, const char *pName)
+ {
+@@ -27,6 +31,9 @@
+ {
+ #ifdef HAVE_LIBDRM
+    VK_FROM_HANDLE(tu_physical_device, pdevice, physicalDevice);
++   if (pdevice->a081_split_kms &&
++       tu_a081_display_matches_fd(fd, pdevice->master_fd))
++      return true;
+    return wsi_common_drm_devices_equal(fd, pdevice->local_fd);
+ #else
+    return true;
+@@ -53,6 +60,13 @@
+    physical_device->wsi_device.can_present_on_device =
+       tu_wsi_can_present_on_device;
+ 
++   /* msm-kms has no GPU syncobj ioctls. Keep those on the real render node;
++    * KMS still receives the original SYNC_FD fence and DMA-BUF image.
++    */
++   if (physical_device->a081_split_kms)
++      wsi_device_setup_syncobj_fd(&physical_device->wsi_device,
++                                 physical_device->local_fd);
++
+    physical_device->vk.wsi_device = &physical_device->wsi_device;
+ 
+    return VK_SUCCESS;
+--- /dev/null
++++ b/src/freedreno/vulkan/tu_a081_display.h
+@@ -0,0 +1,122 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef TU_A081_DISPLAY_H
++#define TU_A081_DISPLAY_H
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <xf86drm.h>
++#include <xf86drmMode.h>
++
++/* Explicit A081-only selection of the real, separate mainline KMS device.
++ * Rendering and synchronization remain on the existing MSM render node.
++ */
++static inline int
++tu_a081_display_open(const char *path)
++{
++   char model[256] = {};
++   FILE *file = fopen("/proc/device-tree/model", "r");
++   if (!file) {
++      errno = ENODEV;
++      return -1;
++   }
++   size_t length = fread(model, 1, sizeof(model) - 1, file);
++   fclose(file);
++   if (!length || !strstr(model, "A081") || !path || path[0] != '/') {
++      errno = ENODEV;
++      return -1;
++   }
++
++   int fd = open(path, O_RDWR | O_CLOEXEC);
++   if (fd < 0)
++      return -1;
++
++   struct stat st;
++   uint64_t prime = 0;
++   drmVersionPtr version = NULL;
++   drmModeRes *resources = NULL;
++   drmModePlaneRes *planes = NULL;
++   bool connected = false;
++   int saved_errno;
++
++   if (fstat(fd, &st) < 0)
++      goto fail;
++   if (!S_ISCHR(st.st_mode) || drmGetNodeTypeFromFd(fd) != DRM_NODE_PRIMARY) {
++      errno = ENODEV;
++      goto fail;
++   }
++   version = drmGetVersion(fd);
++   if (!version || strcmp(version->name, "msm-kms")) {
++      errno = ENODEV;
++      goto fail;
++   }
++   if (drmGetCap(fd, DRM_CAP_PRIME, &prime) < 0)
++      goto fail;
++   if (!(prime & DRM_PRIME_CAP_IMPORT)) {
++      errno = ENOTSUP;
++      goto fail;
++   }
++   if (drmSetClientCap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1) < 0 ||
++       drmSetClientCap(fd, DRM_CLIENT_CAP_ATOMIC, 1) < 0)
++      goto fail;
++   /* The session owner must first release KWin's master or supply a real
++    * separately managed display session. Do not seize an occupied device.
++    */
++   if (!drmIsMaster(fd)) {
++      errno = EACCES;
++      goto fail;
++   }
++   resources = drmModeGetResources(fd);
++   if (!resources || !resources->count_crtcs) {
++      errno = ENODEV;
++      goto fail;
++   }
++   for (int i = 0; i < resources->count_connectors; i++) {
++      drmModeConnector *connector = drmModeGetConnector(fd, resources->connectors[i]);
++      if (!connector)
++         continue;
++      if (connector->connection == DRM_MODE_CONNECTED) {
++         for (int m = 0; m < connector->count_modes; m++) {
++            if (connector->modes[m].hdisplay == 1920 &&
++                connector->modes[m].vdisplay == 3664)
++               connected = true;
++         }
++      }
++      drmModeFreeConnector(connector);
++   }
++   planes = drmModeGetPlaneResources(fd);
++   if (!connected || !planes || !planes->count_planes) {
++      errno = ENODEV;
++      goto fail;
++   }
++
++   drmModeFreePlaneResources(planes);
++   drmModeFreeResources(resources);
++   drmFreeVersion(version);
++   return fd;
++
++fail:
++   saved_errno = errno;
++   if (planes)
++      drmModeFreePlaneResources(planes);
++   if (resources)
++      drmModeFreeResources(resources);
++   if (version)
++      drmFreeVersion(version);
++   close(fd);
++   errno = saved_errno;
++   return -1;
++}
++
++static inline bool
++tu_a081_display_matches_fd(int fd, int display_fd)
++{
++   struct stat actual, selected;
++   return fstat(fd, &actual) == 0 && fstat(display_fd, &selected) == 0 &&
++          S_ISCHR(actual.st_mode) && actual.st_rdev == selected.st_rdev;
++}
++
++#endif
+--- a/src/vulkan/wsi/wsi_common_display.c
++++ b/src/vulkan/wsi/wsi_common_display.c
+@@ -1859,15 +1859,20 @@
+ 
+    memset(image->buffer, 0, sizeof (image->buffer));
+ 
++   /* All planes share one dma-buf. PRIME reimports return the same handle
++    * without adding a handle reference, so import and close it only once.
++    */
++   int ret = drmPrimeFDToHandle(wsi->fd, image->base.dma_buf_fd,
++                               &image->buffer[0]);
++   if (ret < 0)
++      goto fail_handle;
++
+    /* The kernel expects a modifier for each plane for historical reasons, but
+     * they all have to be the same.
+     */
+    uint64_t drm_modifier[4] = {};
+    for (unsigned int i = 0; i < image->base.num_planes; i++) {
+-      int ret = drmPrimeFDToHandle(wsi->fd, image->base.dma_buf_fd,
+-                                   &image->buffer[i]);
+-      if (ret < 0)
+-         goto fail_handle;
++      image->buffer[i] = image->buffer[0];
+       drm_modifier[i] = image->base.drm_modifier;
+    }
+ 
+@@ -1884,7 +1889,7 @@
+       fb_flags |= DRM_MODE_FB_MODIFIERS;
+    }
+ 
+-   int ret = drmModeAddFB2WithModifiers(wsi->fd,
++   ret = drmModeAddFB2WithModifiers(wsi->fd,
+                                         create_info->imageExtent.width,
+                                         create_info->imageExtent.height,
+                                         drm_format,
+@@ -1902,10 +1907,8 @@
+ 
+ fail_fb:
+ fail_handle:
+-   for (unsigned int i = 0; i < image->base.num_planes; i++) {
+-      if (image->buffer[i])
+-         wsi_display_destroy_buffer(wsi, image->buffer[i]);
+-   }
++   if (image->buffer[0])
++      wsi_display_destroy_buffer(wsi, image->buffer[0]);
+ 
+    wsi_destroy_image(&chain->base, &image->base);
+ 
+@@ -1921,8 +1924,7 @@
+    struct wsi_display *wsi = chain->wsi;
+ 
+    drmModeRmFB(wsi->fd, image->fb_id);
+-   for (unsigned int i = 0; i < image->base.num_planes; i++)
+-      wsi_display_destroy_buffer(wsi, image->buffer[i]);
++   wsi_display_destroy_buffer(wsi, image->buffer[0]);
+    wsi_destroy_image(&chain->base, &image->base);
+ }
+ 
+@@ -3723,6 +3725,28 @@
+    return chain->status;
+ }
+ 
++static void
++wsi_display_log_present_wait(struct wsi_display_swapchain *chain,
++                            const char *stage, VkResult result,
++                            uint64_t requested, uint64_t timeout,
++                            uint64_t start_ns)
++{
++   static uint32_t messages;
++   if (!debug_get_bool_option("TU_A081_PRESENT_WAIT_DEBUG", false) ||
++       p_atomic_inc_return(&messages) > 16)
++      return;
++
++   mtx_lock(&chain->present_id_mutex);
++   uint64_t completed = chain->present_id;
++   VkResult display_error = chain->present_id_error;
++   mtx_unlock(&chain->present_id_mutex);
++   mesa_logw("A081 present wait: stage=%s result=%d requested=%" PRIu64
++             " completed=%" PRIu64 " timeout_ns=%" PRIu64
++             " elapsed_ns=%" PRIu64 " display_error=%d",
++             stage, result, requested, completed, timeout,
++             os_time_get_nano() - start_ns, display_error);
++}
++
+ static VkResult
+ wsi_display_wait_for_present(struct wsi_swapchain *wsi_chain,
+                              uint64_t waitValue,
+@@ -3731,6 +3755,7 @@
+    struct wsi_display_swapchain *chain = (struct wsi_display_swapchain *)wsi_chain;
+    struct timespec abs_timespec;
+    uint64_t abs_timeout = 0;
++   uint64_t diagnostic_start = os_time_get_nano();
+    
+    MESA_TRACE_FUNC();
+ 
+@@ -3741,8 +3766,11 @@
+     * as this is guaranteed when a present is complete. */
+    VkResult result = wsi_swapchain_wait_for_present_semaphore(
+       &chain->base, waitValue, timeout);
+-   if (result != VK_SUCCESS)
++   if (result != VK_SUCCESS) {
++      wsi_display_log_present_wait(chain, "gpu-timeline", result,
++                                  waitValue, timeout, diagnostic_start);
+       return result;
++   }
+ 
+    timespec_from_nsec(&abs_timespec, abs_timeout);
+ 
+@@ -3764,6 +3792,9 @@
+    if (result == VK_SUCCESS && chain->present_id_error)
+       result = chain->present_id_error;
+    mtx_unlock(&chain->present_id_mutex);
++   if (result != VK_SUCCESS)
++      wsi_display_log_present_wait(chain, "kms-pageflip", result,
++                                  waitValue, timeout, diagnostic_start);
+    return result;
+ }
+ 

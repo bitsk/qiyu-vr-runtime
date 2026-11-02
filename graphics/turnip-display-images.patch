@@ -1,0 +1,20 @@
+--- a/src/vulkan/wsi/wsi_common_display.c
++++ b/src/vulkan/wsi/wsi_common_display.c
+@@ -50,6 +50,7 @@
+  */
+ 
+ #include "util/u_atomic.h"
++#include "util/u_debug.h"
+ #include "util/macros.h"
+ #include <bits/pthreadtypes.h>
+ #include <pthread.h>
+@@ -3811,7 +3812,8 @@
+    if (drm_format == 0)
+       return VK_ERROR_DEVICE_LOST;
+ 
+-   const unsigned num_images = create_info->minImageCount;
++   const unsigned num_images = debug_get_bool_option("TU_A081_THREE_IMAGES", false) ?
++      MAX2(3, create_info->minImageCount) : create_info->minImageCount;
+    struct wsi_display_swapchain *chain =
+       vk_zalloc(allocator,
+                 sizeof(*chain) + num_images * sizeof(chain->images[0]),

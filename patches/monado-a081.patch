@@ -1,0 +1,1138 @@
+--- a/src/xrt/compositor/main/comp_renderer.c
++++ b/src/xrt/compositor/main/comp_renderer.c
+@@ -51,6 +51,9 @@
+ #include <stdio.h>
+ #include <assert.h>
+ #include <math.h>
++#include <inttypes.h>
++
++DEBUG_GET_ONCE_BOOL_OPTION(a081_frame_timing, "XRT_A081_COMPOSITOR_TIMING", false)
+ 
+ DEBUG_GET_ONCE_LOG_OPTION(comp_frame_lag_level, "XRT_COMP_FRAME_LAG_LOG_AS_LEVEL", U_LOGGING_WARN)
+ #define LOG_FRAME_LAG(...) U_LOG_IFL(debug_get_log_option_comp_frame_lag_level(), u_log_get_global_level(), __VA_ARGS__)
+@@ -1025,6 +1028,13 @@
+ 	struct comp_target *ct = r->c->target;
+ 	struct comp_compositor *c = r->c;
+ 
++	// Opt-in observation only: do not change submission, waits or pacing.
++	const bool timing = debug_get_bool_option_a081_frame_timing();
++	uint64_t phases[7] = {0};
++	uint64_t measured_gpu_ns = 0;
++	bool measured_gpu_valid = false;
++	if (timing) phases[0] = os_monotonic_get_ns();
++
+ 	// Check that we don't have any bad data.
+ 	assert(!comp_frame_is_invalid_locked(&c->frame.waited));
+ 	assert(comp_frame_is_invalid_locked(&c->frame.rendering));
+@@ -1057,6 +1067,8 @@
+ 	}
+ 
+ 	comp_target_update_timings(ct);
++
++	if (timing) phases[1] = os_monotonic_get_ns();
+ 
+ 	// Hardcoded for now.
+ 	const uint32_t view_count = c->nr.view_count;
+@@ -1093,6 +1105,7 @@
+ 	if (res != VK_SUCCESS) {
+ 		return XRT_ERROR_VULKAN;
+ 	}
++	if (timing) phases[2] = os_monotonic_get_ns();
+ 
+ #ifdef XRT_FEATURE_WINDOW_PEEK
+ 	if (c->peek) {
+@@ -1128,6 +1141,7 @@
+ 
+ 	renderer_present_swapchain_image(r, c->frame.rendering.desired_present_time_ns,
+ 	                                 c->frame.rendering.present_slop_ns);
++	if (timing) phases[3] = os_monotonic_get_ns();
+ 
+ 	// Save for timestamps below.
+ 	uint64_t frame_id = c->frame.rendering.id;
+@@ -1172,6 +1186,7 @@
+ 	 * This is done after a swap so isn't time critical.
+ 	 */
+ 	renderer_wait_queue_idle(r);
++	if (timing) phases[4] = os_monotonic_get_ns();
+ 
+ 	/*
+ 	 * Free any resources and finalize the scratch images,
+@@ -1189,6 +1204,18 @@
+ 		if (render_resources_get_timestamps(&c->nr, &gpu_start_ns, &gpu_end_ns)) {
+ 			uint64_t now_ns = os_monotonic_get_ns();
+ 			comp_target_info_gpu(ct, frame_id, gpu_start_ns, gpu_end_ns, now_ns);
++			if (timing && gpu_end_ns >= gpu_start_ns) {
++				measured_gpu_ns = gpu_end_ns - gpu_start_ns;
++				measured_gpu_valid = true;
++			}
++		}
++		// A duration needs no GPU-to-host clock mapping. Use only the existing
++		// two queries after the existing queue-idle wait; never invent an epoch.
++		if (timing && !measured_gpu_valid && c->base.vk.features.timestamp_valid_bits > 0) {
++			measured_gpu_valid = render_resources_get_duration(&c->nr, &measured_gpu_ns);
++			if (measured_gpu_valid && measured_gpu_ns > os_monotonic_get_ns() - phases[0]) {
++				measured_gpu_valid = false; // Invalid result or timestamp wrap.
++			}
+ 		}
+ 	}
+ 
+@@ -1203,10 +1230,27 @@
+ 		render_gfx_fini(&render_g);
+ 	}
+ 
++	if (timing) phases[5] = os_monotonic_get_ns();
+ 	renderer_wait_for_present(r, desired_present_time_ns);
+ 
+ 	comp_target_update_timings(ct);
+ 
++	if (timing) {
++		phases[6] = os_monotonic_get_ns();
++		fprintf(stderr,
++		        "A081_COMP_TIMING frame=%" PRIu64 " mono_start_ns=%" PRIu64
++		        " acquire_update_ns=%" PRIu64 " dispatch_ns=%" PRIu64
++		        " present_call_ns=%" PRIu64 " queue_idle_ns=%" PRIu64
++		        " finish_query_ns=%" PRIu64 " wait_present_ns=%" PRIu64 " total_ns=%" PRIu64
++		        " gpu_duration_valid=%u gpu_duration_ns=%" PRIu64
++		        " compute=%u calibrated=%u present_wait_supported=%u\n",
++		        frame_id, phases[0], phases[1] - phases[0], phases[2] - phases[1],
++		        phases[3] - phases[2], phases[4] - phases[3], phases[5] - phases[4],
++		        phases[6] - phases[5], phases[6] - phases[0],
++		        (unsigned)measured_gpu_valid, measured_gpu_ns, (unsigned)use_compute,
++		        (unsigned)c->base.vk.has_EXT_calibrated_timestamps,
++		        (unsigned)ct->wait_for_present_supported);
++	}
+ 	return xret;
+ }
+ 
+--- a/src/xrt/compositor/main/comp_settings.c
++++ b/src/xrt/compositor/main/comp_settings.c
+@@ -171,8 +171,10 @@
+ 	if (debug_get_bool_option_force_wayland()) {
+ 		s->target_identifier = "wayland";
+ 
+-		// HMD screen tends to be much larger then monitors.
+-		s->preferred.width /= 2;
+-		s->preferred.height /= 2;
++		// Fullscreen may be the actual HMD panel on split GPU/KMS systems.
++		if (!s->fullscreen) {
++			s->preferred.width /= 2;
++			s->preferred.height /= 2;
++		}
+ 	}
+ }
+--- /dev/null
++++ b/src/xrt/state_trackers/steamvr_drv/a081_controller_openvr.hpp
+@@ -0,0 +1,202 @@
++// SPDX-License-Identifier: BSL-1.0
++#pragma once
++#include "a081_controller_pose_wire.h"
++#include <atomic>
++#include <cerrno>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++/* Private opt-in extension to the existing A081 Monado SteamVR provider.
++ * RunFrame consumes a bounded number of actual SDK measurements; GetPose
++ * never predicts, fabricates controller coordinates, or reuses stale poses.
++ */
++class A081ControllerPosePair {
++    struct Sample {
++        a081_controller_pose_packet packet{};
++        uint64_t received_ns = 0;
++    };
++    class Device final : public vr::ITrackedDeviceServerDriver {
++    public:
++        Device(A081ControllerPosePair &owner, unsigned hand) : owner(owner), hand(hand) {}
++        vr::EVRInitError Activate(vr::TrackedDeviceIndex_t object) override
++        {
++            index.store(object);
++            auto p = vr::VRProperties()->TrackedDeviceToPropertyContainer(object);
++            vr::VRProperties()->SetStringProperty(p, vr::Prop_TrackingSystemName_String, "monado");
++            vr::VRProperties()->SetStringProperty(p, vr::Prop_ModelNumber_String,
++                hand ? "Qiyu MIX right controller (SDK pose candidate)" : "Qiyu MIX left controller (SDK pose candidate)");
++            vr::VRProperties()->SetStringProperty(p, vr::Prop_SerialNumber_String, serial());
++            vr::VRProperties()->SetStringProperty(p, vr::Prop_ManufacturerName_String, "iQIYI");
++            vr::VRProperties()->SetStringProperty(p, vr::Prop_ControllerType_String, "a081_controller_pose");
++            vr::VRProperties()->SetInt32Property(p, vr::Prop_ControllerRoleHint_Int32,
++                hand ? vr::TrackedControllerRole_RightHand : vr::TrackedControllerRole_LeftHand);
++            // Diagnostic locator, not a fabricated vendor model or button layout.
++            vr::VRProperties()->SetStringProperty(p, vr::Prop_RenderModelName_String, "locator_one_sided");
++            return vr::VRInitError_None;
++        }
++        void Deactivate() override { index.store(vr::k_unTrackedDeviceIndexInvalid); }
++        void EnterStandby() override {}
++        void *GetComponent(const char *) override { return nullptr; }
++        void DebugRequest(const char *, char *response, uint32_t size) override
++        {
++            if (!size) return;
++            auto p = GetPose();
++            std::snprintf(response, size, "A081 SDK pose hand=%u connected=%d valid=%d; no optical/coordinate acceptance implied",
++                          hand, p.deviceIsConnected, p.poseIsValid);
++        }
++        vr::DriverPose_t GetPose() override { return owner.pose(hand); }
++        const char *serial() const { return hand ? "A081-STOCK-CONTROLLER-R" : "A081-STOCK-CONTROLLER-L"; }
++        void publish()
++        {
++            auto id = index.load();
++            if (id != vr::k_unTrackedDeviceIndexInvalid)
++                vr::VRServerDriverHost()->TrackedDevicePoseUpdated(id, GetPose(), sizeof(vr::DriverPose_t));
++        }
++    private:
++        A081ControllerPosePair &owner;
++        unsigned hand;
++        std::atomic<vr::TrackedDeviceIndex_t> index{vr::k_unTrackedDeviceIndexInvalid};
++    };
++public:
++    A081ControllerPosePair() : left(*this, 0), right(*this, 1) {}
++    ~A081ControllerPosePair() { close_source(); }
++    bool configure(bool a081_head)
++    {
++        const char *requested = std::getenv("A081_CONTROLLER_POSE_SOCKET");
++        if (!requested || !*requested) return true; // baseline HMD-only path
++        const char *profile = std::getenv("A081_CONTROLLER_POSE_PROFILE");
++        if (!a081_head || !profile || std::strcmp(profile, "openvr-head-raw-v1") ||
++            std::strncmp(requested, "/run/a081-controller-pose-", 26) ||
++            std::strlen(requested) >= sizeof(path) || std::strstr(requested, "/../")) {
++            ovrd_log("A081 controller pose refused: exact A081 HMD, private /run socket and explicit profile required\n");
++            return false;
++        }
++        std::strcpy(path, requested);
++        enabled = true;
++        bool added_left = vr::VRServerDriverHost()->TrackedDeviceAdded(left.serial(), vr::TrackedDeviceClass_Controller, &left);
++        bool added_right = vr::VRServerDriverHost()->TrackedDeviceAdded(right.serial(), vr::TrackedDeviceClass_Controller, &right);
++        if (!added_left || !added_right) {
++            ovrd_log("A081 controller registration failed left=%d right=%d\n", added_left, added_right);
++            cleanup(); return false;
++        }
++        ovrd_log("A081 controller pose candidate registered: no buttons/haptics; SDK pose and coordinate gates required, optical flag reports recent vision\n");
++        return true;
++    }
++    void frame()
++    {
++        if (!enabled) return;
++        uint64_t now = os_monotonic_get_ns();
++        if (fd < 0 && now >= retry_ns) {
++            retry_ns = now + UINT64_C(1000000000);
++            connect_source();
++        }
++        if (fd >= 0) {
++            for (unsigned i = 0; i < 128; ++i) {
++                a081_controller_pose_packet p{};
++                ssize_t n = recv(fd, &p, sizeof(p), MSG_DONTWAIT | MSG_TRUNC);
++                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) break;
++                if (n != sizeof(p) || !consume(p, os_monotonic_get_ns())) {
++                    close_source(); break;
++                }
++            }
++        }
++        left.publish(); right.publish();
++    }
++    void cleanup()
++    {
++        enabled = false;
++        close_source();
++        left.Deactivate(); right.Deactivate();
++        path[0] = '\0'; retry_ns = 0;
++    }
++private:
++    void close_source()
++    {
++        if (fd >= 0) { close(fd); fd = -1; }
++        std::lock_guard<std::mutex> lock(mutex);
++        samples[0] = {}; samples[1] = {}; session = 0;
++    }
++    void connect_source()
++    {
++        // Require the root-owned relay used by the SDK producer. No sensor or
++        // Android device nodes are opened from this unprivileged driver.
++        struct stat info{};
++        if (lstat(path, &info) || !S_ISSOCK(info.st_mode) || info.st_uid != 0 || (info.st_mode & 0002)) return;
++        sockaddr_un addr{}; addr.sun_family = AF_UNIX;
++        std::strcpy(addr.sun_path, path);
++        int candidate = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
++        if (candidate < 0) return;
++        if (connect(candidate, reinterpret_cast<sockaddr *>(&addr), sizeof(addr))) { close(candidate); return; }
++        ucred peer{}; socklen_t length = sizeof(peer);
++        if (getsockopt(candidate, SOL_SOCKET, SO_PEERCRED, &peer, &length) || length != sizeof(peer) || peer.uid != 0) {
++            close(candidate); return;
++        }
++        fd = candidate;
++        ovrd_log("A081 controller pose connected to root relay\n");
++    }
++    bool consume(const a081_controller_pose_packet &p, uint64_t now)
++    {
++        if (p.magic != A081_CONTROLLER_POSE_MAGIC || p.version != A081_CONTROLLER_POSE_VERSION ||
++            p.bytes != sizeof(p) || p.hand > 1 || !p.session_id || !p.sequence ||
++            (p.flags & ~A081_CONTROLLER_POSE_KNOWN_FLAGS) || p.reserved0 || p.reserved1 ||
++            p.coordinate_profile > A081_CONTROLLER_PROFILE_OPENVR_HEAD_RAW ||
++            !p.send_monotonic_ns || p.send_monotonic_ns > now ||
++            now - p.send_monotonic_ns >= A081_CONTROLLER_POSE_MAX_AGE_NS || !std::isfinite(p.confidence)) return false;
++        for (float v : p.position) if (!std::isfinite(v)) return false;
++        for (float v : p.orientation_xyzw) if (!std::isfinite(v)) return false;
++        if ((p.flags & A081_CONTROLLER_CLOCK_VALID) && (!p.sample_monotonic_ns ||
++            p.sample_monotonic_ns > p.send_monotonic_ns)) return false;
++        std::lock_guard<std::mutex> lock(mutex);
++        Sample &s = samples[p.hand];
++        if ((session && session != p.session_id) || p.sequence <= s.packet.sequence ||
++            ((p.flags & A081_CONTROLLER_CLOCK_VALID) && (s.packet.flags & A081_CONTROLLER_CLOCK_VALID) &&
++             p.sample_monotonic_ns < s.packet.sample_monotonic_ns)) return false;
++        session = p.session_id;
++        s.packet = p; s.received_ns = now;
++        return true;
++    }
++    vr::DriverPose_t pose(unsigned hand)
++    {
++        vr::DriverPose_t out{};
++        out.qWorldFromDriverRotation.w = 1;
++        out.qDriverFromHeadRotation.w = 1;
++        out.qRotation.w = 1;
++        out.result = vr::TrackingResult_Uninitialized;
++        Sample sample;
++        { std::lock_guard<std::mutex> lock(mutex); sample = samples[hand]; }
++        const auto &p = sample.packet;
++        uint64_t now = os_monotonic_get_ns();
++        if (!sample.received_ns || now < sample.received_ns ||
++            now - sample.received_ns >= A081_CONTROLLER_POSE_MAX_AGE_NS || now < p.send_monotonic_ns ||
++            now - p.send_monotonic_ns >= A081_CONTROLLER_POSE_MAX_AGE_NS) return out;
++        out.deviceIsConnected = p.flags & A081_CONTROLLER_CONNECTED;
++        out.result = vr::TrackingResult_Running_OutOfRange;
++        float norm = 0;
++        for (float v : p.orientation_xyzw) norm += v * v;
++        bool valid = (p.flags & A081_CONTROLLER_POSE_REQUIRED_FLAGS) == A081_CONTROLLER_POSE_REQUIRED_FLAGS &&
++            p.coordinate_profile == A081_CONTROLLER_PROFILE_OPENVR_HEAD_RAW && p.confidence >= .1f &&
++            p.sample_monotonic_ns && p.sample_monotonic_ns <= now &&
++            now - p.sample_monotonic_ns < A081_CONTROLLER_POSE_MAX_AGE_NS && std::fabs(norm - 1.f) < .01f;
++        if (!valid) return out;
++        out.poseIsValid = true;
++        out.result = vr::TrackingResult_Running_OK;
++        out.poseTimeOffset = -double(now - p.sample_monotonic_ns) / 1e9;
++        for (unsigned i = 0; i < 3; ++i) out.vecPosition[i] = p.position[i];
++        out.qRotation = {p.orientation_xyzw[3], p.orientation_xyzw[0], p.orientation_xyzw[1], p.orientation_xyzw[2]};
++        return out;
++    }
++    Device left, right;
++    std::mutex mutex;
++    Sample samples[2]{};
++    uint64_t session = 0, retry_ns = 0;
++    int fd = -1;
++    bool enabled = false;
++    char path[sizeof(sockaddr_un::sun_path)]{};
++};
+--- a/src/xrt/state_trackers/steamvr_drv/ovrd_driver.cpp
++++ b/src/xrt/state_trackers/steamvr_drv/ovrd_driver.cpp
+@@ -15,6 +15,9 @@
+ #include <cstring>
+ #include <cassert>
+ #include <array>
++#include <algorithm>
++#include <atomic>
++#include <system_error>
+ #include <thread>
+ 
+ #include "math/m_api.h"
+@@ -42,6 +45,7 @@
+ #include "b_ovrd_generated_bindings.h"
+ }
+ #include "math/m_vec3.h"
++#include "a081_controller_openvr.hpp"
+ 
+ #if defined(__GNUC__)
+ #pragma GCC diagnostic push
+@@ -54,6 +58,10 @@
+ DEBUG_GET_ONCE_BOOL_OPTION(emulate_index_controller, "STEAMVR_EMULATE_INDEX_CONTROLLER", false)
+ 
+ DEBUG_GET_ONCE_NUM_OPTION(scale_percentage, "XRT_COMPOSITOR_SCALE_PERCENTAGE", 140)
++
++// Opt-in metadata for trying the physical A081 panel on an existing desktop.
++// This does not implement or bypass SteamVR's native presentation backend.
++DEBUG_GET_ONCE_BOOL_OPTION(a081_steamvr_extended, "A081_STEAMVR_EXTENDED", false)
+ 
+ #define MODELNUM_LEN (XRT_DEVICE_NAME_LEN + 9) // "[Monado] "
+ 
+@@ -1170,7 +1178,7 @@
+ 		ovrd_log("IPD: %f\n", m_flIPD);
+ 	};
+ 	// clang-format off
+-	virtual ~CDeviceDriver_Monado() {};
++	virtual ~CDeviceDriver_Monado() { Deactivate(); };
+ 
+ 	// ITrackedDeviceServerDriver
+ 	virtual vr::EVRInitError Activate(vr::TrackedDeviceIndex_t unObjectId);
+@@ -1207,7 +1215,7 @@
+ 	struct xrt_fov m_fovs[2];
+ 	struct xrt_pose m_view_pose[2];
+ 
+-	bool m_poseUpdating = true;
++	std::atomic<bool> m_poseUpdating{false};
+ 	std::thread *m_poseUpdateThread = NULL;
+ 	virtual void PoseUpdateThreadFunction();
+ 
+@@ -1250,6 +1258,9 @@
+ vr::EVRInitError
+ CDeviceDriver_Monado::Activate(vr::TrackedDeviceIndex_t unObjectId)
+ {
++	if (m_poseUpdateThread != NULL) {
++		return vr::VRInitError_Driver_Failed;
++	}
+ 	ovrd_log("Activate tracked device %u: %s\n", unObjectId, m_xdev->str);
+ 
+ 	m_trackedDeviceIndex = unObjectId;
+@@ -1274,6 +1285,14 @@
+ 	// avoid "not fullscreen" warnings from vrmonitor
+ 	//vr::VRProperties()->SetBoolProperty(m_ulPropertyContainer, vr::Prop_IsOnDesktop_Bool, false);
+ 
++	if (strcmp(m_xdev->serial, "A081-LINUX-IIO") == 0) {
++		vr::VRProperties()->SetBoolProperty(m_ulPropertyContainer, vr::Prop_IsOnDesktop_Bool, IsDisplayOnDesktop());
++		vr::VRProperties()->SetBoolProperty(m_ulPropertyContainer, vr::Prop_HasDisplayComponent_Bool, true);
++		vr::VRProperties()->SetBoolProperty(m_ulPropertyContainer, vr::Prop_HasDriverDirectModeComponent_Bool, false);
++		vr::VRProperties()->SetBoolProperty(m_ulPropertyContainer, vr::Prop_HasVirtualDisplayComponent_Bool, false);
++		ovrd_log("A081 display component: desktop=%d, driver direct mode=0, virtual display=0\n", IsDisplayOnDesktop());
++	}
++
+ 	// clang-format on
+ 
+ 
+@@ -1286,9 +1305,12 @@
+ 	vr::VRServerDriverHost()->SetDisplayEyeToHead(m_trackedDeviceIndex, left, right);
+ 
+ 
+-	m_poseUpdateThread = new std::thread(&CDeviceDriver_Monado::PoseUpdateThreadFunction, this);
+-	if (!m_poseUpdateThread) {
+-		ovrd_log("Unable to create pose updated thread for %s\n", m_xdev->str);
++	m_poseUpdating = true;
++	try {
++		m_poseUpdateThread = new std::thread(&CDeviceDriver_Monado::PoseUpdateThreadFunction, this);
++	} catch (const std::system_error &) {
++		m_poseUpdating = false;
++		ovrd_log("Unable to create pose update thread for %s\n", m_xdev->str);
+ 		return vr::VRInitError_Driver_Failed;
+ 	}
+ 
+@@ -1299,7 +1321,14 @@
+ CDeviceDriver_Monado::Deactivate()
+ {
+ 	m_poseUpdating = false;
+-	m_poseUpdateThread->join();
++	if (m_poseUpdateThread != NULL) {
++		if (m_poseUpdateThread->joinable()) {
++			m_poseUpdateThread->join();
++		}
++		delete m_poseUpdateThread;
++		m_poseUpdateThread = NULL;
++	}
++	m_trackedDeviceIndex = vr::k_unTrackedDeviceIndexInvalid;
+ 	ovrd_log("Deactivate\n");
+ }
+ 
+@@ -1338,13 +1367,20 @@
+ 	};
+ }
+ 
++extern "C" bool a081_qvr_latest_pose(struct xrt_device *, struct xrt_space_relation *, int64_t *);
++
+ vr::DriverPose_t
+ CDeviceDriver_Monado::GetPose()
+ {
+ 
+ 	timepoint_ns now_ns = os_monotonic_get_ns();
+ 	struct xrt_space_relation rel;
+-	xrt_device_get_tracked_pose(m_xdev, XRT_INPUT_GENERIC_HEAD_POSE, now_ns, &rel);
++	int64_t sample_ns = now_ns;
++	bool raw_qvr = strcmp(m_xdev->serial, "A081-LINUX-IIO") == 0 && m_xdev->supported.position_tracking;
++	if (raw_qvr)
++		a081_qvr_latest_pose(m_xdev, &rel, &sample_ns);
++	else
++		xrt_device_get_tracked_pose(m_xdev, XRT_INPUT_GENERIC_HEAD_POSE, now_ns, &rel);
+ 
+ 	struct xrt_pose *offset = &m_xdev->tracking_origin->initial_offset;
+ 
+@@ -1354,8 +1390,8 @@
+ 	m_relation_chain_resolve(&chain, &rel);
+ 
+ 	vr::DriverPose_t t = {
+-	    // monado predicts pose "now", see xrt_device_get_tracked_pose
+-	    .poseTimeOffset = 0,
++	    // QVR supplies an unpredicted measured sample with its actual monotonic time.
++	    .poseTimeOffset = raw_qvr ? double(sample_ns - int64_t(os_monotonic_get_ns())) / 1e9 : 0,
+ 	    .qWorldFromDriverRotation = HmdQuaternion_Init(1, 0, 0, 0),
+ 	    .vecWorldFromDriverTranslation = {0, 0, 0},
+ 
+@@ -1372,12 +1408,20 @@
+ 	    .vecAngularAcceleration = {0, 0, 0},
+ 
+ 	    .result = vr::TrackingResult_Running_OK,
+-	    .poseIsValid = (rel.relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) != 0,
++	    .poseIsValid = raw_qvr ?
++	                   (rel.relation_flags & (XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
++	                                          XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT)) ==
++	                    (XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
++	                     XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT) :
++	                    (rel.relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) != 0,
+ 	    .willDriftInYaw = !m_xdev->supported.position_tracking,
+-	    //! @todo: Monado head model?
+-	    .shouldApplyHeadModel = !m_xdev->supported.position_tracking,
++	    // A081 supplies measured orientation only; do not synthesize neck motion.
++	    .shouldApplyHeadModel = !m_xdev->supported.position_tracking &&
++	                            strcmp(m_xdev->serial, "A081-LINUX-IIO") != 0,
+ 	    .deviceIsConnected = true,
+ 	};
++	if (strcmp(m_xdev->serial, "A081-LINUX-IIO") == 0 && m_xdev->supported.position_tracking && !t.poseIsValid)
++		t.result = vr::TrackingResult_Running_OutOfRange;
+ 	apply_pose(&rel, &t);
+ 
+ #ifdef DUMP_POSE
+@@ -1400,8 +1444,8 @@
+ void
+ CDeviceDriver_Monado::GetWindowBounds(int32_t *pnX, int32_t *pnY, uint32_t *pnWidth, uint32_t *pnHeight)
+ {
+-	// offset in extended mode, e.g. to the right of a 1920x1080 monitor
+-	*pnX = 1920;
++	// A081's complete panel starts at zero; it is not a second desktop monitor.
++	*pnX = strcmp(m_xdev->serial, "A081-LINUX-IIO") == 0 ? 0 : 1920;
+ 	*pnY = 0;
+ 
+ 	*pnWidth = m_xdev->hmd->screens[0].w_pixels;
+@@ -1414,7 +1458,7 @@
+ bool
+ CDeviceDriver_Monado::IsDisplayOnDesktop()
+ {
+-	return false;
++	return strcmp(m_xdev->serial, "A081-LINUX-IIO") == 0 && debug_get_bool_option_a081_steamvr_extended();
+ }
+ 
+ bool
+@@ -1431,8 +1475,17 @@
+ 
+ 
+ 
+-	*pnWidth = m_xdev->hmd->screens[0].w_pixels * fscale;
+-	*pnHeight = m_xdev->hmd->screens[0].h_pixels * fscale;
++	if (strcmp(m_xdev->serial, "A081-LINUX-IIO") == 0) {
++		// Render dimensions precede the existing per-eye panel rotation. These
++		// are the A081 bring-up dimensions, not newly calibrated lens geometry.
++		*pnWidth = std::max(m_xdev->hmd->views[0].display.w_pixels,
++		                   m_xdev->hmd->views[1].display.w_pixels) * fscale;
++		*pnHeight = std::max(m_xdev->hmd->views[0].display.h_pixels,
++		                    m_xdev->hmd->views[1].display.h_pixels) * fscale;
++	} else {
++		*pnWidth = m_xdev->hmd->screens[0].w_pixels * fscale;
++		*pnHeight = m_xdev->hmd->screens[0].h_pixels * fscale;
++	}
+ 
+ 	ovrd_log("Render Target Size: %dx%d (%fx)\n", *pnWidth, *pnHeight, fscale);
+ }
+@@ -1549,6 +1602,7 @@
+ 	CDeviceDriver_Monado *m_MonadoDeviceDriver = NULL;
+ 	CDeviceDriver_Monado_Controller *m_left = NULL;
+ 	CDeviceDriver_Monado_Controller *m_right = NULL;
++	A081ControllerPosePair m_a081_pose_controllers;
+ };
+ 
+ CServerDriver_Monado g_serverDriverMonado;
+@@ -1620,12 +1674,15 @@
+ 		ovrd_log("Added right Controller: %s\n", right_xdev->str);
+ 	}
+ 
++	if (!m_a081_pose_controllers.configure(strcmp(m_xhmd->serial, "A081-LINUX-IIO") == 0))
++		return vr::VRInitError_Driver_Failed;
+ 	return vr::VRInitError_None;
+ }
+ 
+ void
+ CServerDriver_Monado::Cleanup()
+ {
++	m_a081_pose_controllers.cleanup();
+ 	if (m_MonadoDeviceDriver != NULL) {
+ 		delete m_MonadoDeviceDriver;
+ 		m_MonadoDeviceDriver = NULL;
+@@ -1635,8 +1692,13 @@
+ 	xrt_system_devices_destroy(&m_xsysd);
+ 	xrt_system_destroy(&m_xsys);
+ 	m_xhmd = NULL;
+-	m_left->m_xdev = NULL;
+-	m_right->m_xdev = NULL;
++	// A081 currently supplies an HMD only, without either controller.
++	if (m_left != NULL) {
++		m_left->m_xdev = NULL;
++	}
++	if (m_right != NULL) {
++		m_right->m_xdev = NULL;
++	}
+ 
+ 	if (m_xinst) {
+ 		xrt_instance_destroy(&m_xinst);
+@@ -1690,6 +1752,7 @@
+ void
+ CServerDriver_Monado::RunFrame()
+ {
++	m_a081_pose_controllers.frame();
+ 	if (m_left) {
+ 		m_left->RunFrame();
+ 	}
+--- a/src/xrt/targets/common/CMakeLists.txt
++++ b/src/xrt/targets/common/CMakeLists.txt
+@@ -297,3 +297,6 @@
+ 
+ 	target_link_libraries(target_instance_no_comp PRIVATE aux_android)
+ endif()
++
++target_sources(target_lists PRIVATE a081_device.c target_builder_a081.c)
++target_link_libraries(target_lists PRIVATE aux_math)
+--- /dev/null
++++ b/src/xrt/targets/common/a081_device.c
+@@ -0,0 +1,433 @@
++// SPDX-License-Identifier: BSL-1.0
++// A081 real IIO or explicit experimental QVR pose stream; no synthetic input.
++#include "xrt/xrt_device.h"
++#include "math/m_api.h"
++#include "math/m_imu_3dof.h"
++#include "os/os_time.h"
++#include "util/u_device.h"
++#include "util/u_distortion_mesh.h"
++#include "a081_optics.h"
++#include "util/u_logging.h"
++#include "a081_tracking_client.h"
++#include "a081_qvr_pose.h"
++#include <dirent.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <math.h>
++#include <poll.h>
++#include <pthread.h>
++#include <stdatomic.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/file.h>
++#include <unistd.h>
++
++struct saved_attr { char path[512], value[128]; };
++struct stream {
++	int fd;
++	char path[256];
++	struct saved_attr saved[8];
++	unsigned saved_count;
++	bool enabled;
++	double scale;
++	uint64_t samples;
++	int64_t time_ns;
++	struct xrt_vec3 value;
++};
++struct a081 {
++	struct xrt_device base;
++	struct stream accel, gyro;
++	struct m_imu_3dof fusion;
++	pthread_mutex_t mutex;
++	pthread_t thread;
++	atomic_bool running;
++	bool started;
++	int lock_fd;
++	int64_t fused_time_ns;
++	uint64_t fused_samples;
++	bool stock_stream, stock_pose;
++	struct xrt_space_relation stock_relation;
++	uint64_t positive_poses;
++	char tracking_socket[108];
++	uint64_t stream_packets, stock_pose_packets;
++	int64_t stream_start_ns;
++};
++
++static bool read_text(const char *path, char *value, size_t size)
++{
++	FILE *f = fopen(path, "r");
++	if (!f) return false;
++	bool ok = fgets(value, size, f) != NULL;
++	fclose(f);
++	if (ok) value[strcspn(value, "\r\n")] = 0;
++	return ok;
++}
++
++static bool write_text(const char *path, const char *value)
++{
++	int fd = open(path, O_WRONLY | O_CLOEXEC);
++	if (fd < 0) return false;
++	size_t n = strlen(value);
++	bool ok = write(fd, value, n) == (ssize_t)n;
++	close(fd);
++	return ok;
++}
++
++static bool change_attr(struct stream *s, const char *attr, const char *value)
++{
++	if (s->saved_count >= 8) return false;
++	struct saved_attr *old = &s->saved[s->saved_count];
++	snprintf(old->path, sizeof(old->path), "%s/%s", s->path, attr);
++	if (!read_text(old->path, old->value, sizeof(old->value))) return false;
++	if (!write_text(old->path, value)) return false;
++	s->saved_count++;
++	return true;
++}
++
++static void close_stream(struct stream *s)
++{
++	if (s->enabled) {
++		char path[512]; snprintf(path, sizeof(path), "%s/buffer/enable", s->path);
++		if (!write_text(path, "0")) U_LOG_E("A081: failed to disable %s", path);
++	}
++	if (s->fd >= 0) close(s->fd);
++	while (s->saved_count) {
++		struct saved_attr *a = &s->saved[--s->saved_count];
++		if (!write_text(a->path, a->value)) U_LOG_E("A081: failed to restore %s", a->path);
++	}
++	s->fd = -1;
++}
++
++static bool open_stream(struct stream *s, const char *name, const char *channel)
++{
++	DIR *dir = opendir("/sys/bus/iio/devices");
++	if (!dir) return false;
++	struct dirent *e;
++	char node[256] = "", path[512], value[128];
++	while ((e = readdir(dir))) {
++		if (strncmp(e->d_name, "iio:device", 10)) continue;
++		snprintf(path, sizeof(path), "/sys/bus/iio/devices/%s/name", e->d_name);
++		if (read_text(path, value, sizeof(value)) && !strcmp(value, name)) {
++			snprintf(node, sizeof(node), "%s", e->d_name); break;
++		}
++	}
++	closedir(dir);
++	if (!node[0]) { U_LOG_E("A081: missing %s", name); return false; }
++	snprintf(s->path, sizeof(s->path), "/sys/bus/iio/devices/%.200s", node);
++	snprintf(path, sizeof(path), "%s/buffer/enable", s->path);
++	if (!read_text(path, value, sizeof(value)) || strcmp(value, "0")) {
++		U_LOG_E("A081: %s buffer already owned by another reader", name); return false;
++	}
++	// Accept only the actual SEE ABI: xyz signed 32-bit SI micro-units,
++	// padding to 16 bytes, followed by a signed 64-bit nanosecond timestamp.
++	for (int i = 0; i < 4; i++) {
++		char stem[100], expected[8];
++		if (i < 3) snprintf(stem, sizeof(stem), "in_%s_%c", channel, "xyz"[i]);
++		else snprintf(stem, sizeof(stem), "in_timestamp");
++		snprintf(path, sizeof(path), "%s/scan_elements/%s_index", s->path, stem);
++		snprintf(expected, sizeof(expected), "%d", i);
++		if (!read_text(path, value, sizeof(value)) || strcmp(value, expected)) return false;
++		snprintf(path, sizeof(path), "%s/scan_elements/%s_type", s->path, stem);
++		if (!read_text(path, value, sizeof(value)) ||
++		    strcmp(value, i < 3 ? "le:s32/32>>0" : "le:s64/64>>0")) return false;
++		char attr[128]; snprintf(attr, sizeof(attr), "scan_elements/%s_en", stem);
++		if (!change_attr(s, attr, "1")) return false;
++	}
++	snprintf(path, sizeof(path), "%s/in_%s_scale", s->path, channel);
++	if (!read_text(path, value, sizeof(value))) return false;
++	s->scale = strtod(value, NULL);
++	if (!isfinite(s->scale) || s->scale <= 0) return false;
++	if (!change_attr(s, "current_timestamp_clock", "monotonic") ||
++	    !change_attr(s, "buffer/length", "256") || !change_attr(s, "buffer/watermark", "1")) return false;
++	snprintf(path, sizeof(path), "%s/buffer/hwfifo_timeout", s->path);
++	if (access(path, F_OK) == 0 && !change_attr(s, "buffer/hwfifo_timeout", "0")) return false;
++	snprintf(path, sizeof(path), "/dev/%s", node);
++	s->fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
++	if (s->fd < 0) return false;
++	snprintf(path, sizeof(path), "%s/buffer/enable", s->path);
++	if (!write_text(path, "1")) return false;
++	s->enabled = true;
++	U_LOG_I("A081 real IIO: %s %s scale=%g clock=monotonic", name, node, s->scale);
++	return true;
++}
++
++static void *read_imu(void *ptr)
++{
++	struct a081 *d = ptr;
++	struct pollfd p[2] = {{d->accel.fd, POLLIN, 0}, {d->gyro.fd, POLLIN, 0}};
++	while (atomic_load(&d->running)) {
++		int ready = poll(p, 2, 50);
++		if (ready < 0 && errno != EINTR) break;
++		for (int i = 0; i < 2 && ready > 0; i++) {
++			if (p[i].revents & (POLLERR | POLLHUP | POLLNVAL)) goto done;
++			if (!(p[i].revents & POLLIN)) continue;
++			struct stream *s = i ? &d->gyro : &d->accel;
++			struct { int32_t xyz[3], padding; int64_t time_ns; } sample;
++			ssize_t n;
++			// Process bounded batches so shutdown cannot starve.
++			for (int batch = 0; batch < 256; batch++) {
++				n = read(s->fd, &sample, sizeof(sample));
++				if (n < 0 && (errno == EAGAIN || errno == EINTR)) break;
++				if (n != sizeof(sample)) goto done;
++				if (sample.time_ns <= s->time_ns) continue;
++				s->time_ns = sample.time_ns;
++				s->value = (struct xrt_vec3){sample.xyz[0] * s->scale, sample.xyz[1] * s->scale, sample.xyz[2] * s->scale};
++				s->samples++;
++				if (!i || !d->accel.time_ns || llabs(s->time_ns - d->accel.time_ns) > 100000000) continue;
++				pthread_mutex_lock(&d->mutex);
++				if (d->fused_time_ns && s->time_ns - d->fused_time_ns > 100000000) m_imu_3dof_reset(&d->fusion);
++				m_imu_3dof_update(&d->fusion, s->time_ns, &d->accel.value, &s->value);
++				d->fused_time_ns = s->time_ns;
++				d->fused_samples++;
++				if (d->fused_samples % 500 == 0)
++					U_LOG_I("A081 real samples: accel=%lu gyro=%lu fused=%lu timestamp=%ld q=%g,%g,%g,%g",
++					        d->accel.samples, d->gyro.samples, d->fused_samples, d->fused_time_ns,
++					        d->fusion.rot.x, d->fusion.rot.y, d->fusion.rot.z, d->fusion.rot.w);
++				pthread_mutex_unlock(&d->mutex);
++			}
++		}
++	}
++done:
++	atomic_store(&d->running, false);
++	return NULL;
++}
++
++static void reset_stream_tracking(struct a081 *d)
++{
++	pthread_mutex_lock(&d->mutex);
++	m_imu_3dof_reset(&d->fusion);
++	d->fused_samples = 0;
++	d->fused_time_ns = 0;
++	d->stream_start_ns = 0;
++	memset(&d->stock_relation, 0, sizeof(d->stock_relation));
++	pthread_mutex_unlock(&d->mutex);
++}
++
++static void *read_tracking_stream(void *ptr)
++{
++	struct a081 *d = ptr;
++	int fd = -1;
++	uint64_t session = 0, sequence = 0, last_gyro = 0;
++	int64_t retry_at = 0;
++	while (atomic_load(&d->running)) {
++		if (fd < 0) {
++			int64_t now = os_monotonic_get_ns();
++			if (now >= retry_at) {
++				fd = a081_tracking_connect(d->tracking_socket);
++				retry_at = now + 250000000;
++				if (fd >= 0) { session = sequence = last_gyro = 0; reset_stream_tracking(d); }
++			}
++			if (fd < 0) { poll(NULL, 0, 20); continue; }
++		}
++		struct pollfd p = {fd, POLLIN, 0};
++		int ready = poll(&p, 1, 50);
++		if (ready < 0 && errno == EINTR) continue;
++		bool disconnected = ready < 0 || (p.revents & (POLLERR | POLLHUP | POLLNVAL));
++		for (int batch = 0; !disconnected && ready > 0 && batch < 256; ++batch) {
++			struct a081_tracking_packet packet;
++			int rc = a081_tracking_receive(fd, &packet);
++			if (!rc) break;
++			if (rc < 0) { disconnected = true; break; }
++			bool same_session = session == packet.session_id;
++			if (!same_session || packet.sequence != sequence + 1) reset_stream_tracking(d);
++			if (same_session && (packet.sequence <= sequence || packet.gyro_boottime_ns <= last_gyro)) {
++				disconnected = true; break;
++			}
++			session = packet.session_id; sequence = packet.sequence; last_gyro = packet.gyro_boottime_ns;
++			uint64_t now = (uint64_t)os_monotonic_get_ns();
++			if (!(packet.flags & A081_TRACKING_CLOCK) || packet.sample_monotonic_ns > now ||
++			    now - packet.sample_monotonic_ns >= A081_TRACKING_MAX_AGE_NS) {
++				reset_stream_tracking(d); continue;
++			}
++			if (d->stock_pose) {
++				struct xrt_space_relation relation;
++				bool valid = a081_qvr_pose(&packet, now, &relation);
++				pthread_mutex_lock(&d->mutex);
++				d->stock_relation = relation;
++				d->fused_time_ns = (int64_t)packet.sample_monotonic_ns;
++				++d->stream_packets;
++				if (packet.flags & A081_TRACKING_RAW_POSE) ++d->stock_pose_packets;
++				if (valid) ++d->positive_poses;
++				pthread_mutex_unlock(&d->mutex);
++				if (d->stream_packets == 1 || d->stream_packets % 500 == 0)
++					U_LOG_I("A081 QVR pose: packets=%lu accepted=%lu session=%lu seq=%lu quality=%g state=%u valid=%d p=%g,%g,%g q=%g,%g,%g,%g accuracy=uncalibrated origin=raw_tracker",
++					        d->stream_packets, d->positive_poses, packet.session_id, packet.sequence,
++					        packet.pose_quality, packet.tracking_state, valid,
++					        relation.pose.position.x, relation.pose.position.y, relation.pose.position.z,
++					        relation.pose.orientation.x, relation.pose.orientation.y, relation.pose.orientation.z, relation.pose.orientation.w);
++				continue;
++			}
++			struct xrt_vec3 accel = {packet.accel[0], packet.accel[1], packet.accel[2]};
++			struct xrt_vec3 gyro = {packet.gyro[0], packet.gyro[1], packet.gyro[2]};
++			pthread_mutex_lock(&d->mutex);
++			int64_t timestamp = (int64_t)packet.sample_monotonic_ns;
++			if (d->fused_time_ns && timestamp <= d->fused_time_ns) {
++				m_imu_3dof_reset(&d->fusion); d->fused_samples = 0;
++				d->fused_time_ns = d->stream_start_ns = 0;
++				pthread_mutex_unlock(&d->mutex); continue;
++			}
++			if (d->fused_time_ns && timestamp - d->fused_time_ns > 100000000) {
++				m_imu_3dof_reset(&d->fusion); d->fused_samples = 0; d->stream_start_ns = 0;
++			}
++			if (!d->stream_start_ns) d->stream_start_ns = timestamp;
++			m_imu_3dof_update(&d->fusion, timestamp, &accel, &gyro);
++			d->fused_time_ns = timestamp; ++d->fused_samples;
++			++d->stream_packets;
++			if (packet.flags & A081_TRACKING_RAW_POSE) ++d->stock_pose_packets;
++			pthread_mutex_unlock(&d->mutex);
++			if (d->stream_packets == 1 || d->stream_packets % 500 == 0)
++				U_LOG_I("A081 stock stream: packets=%lu pose_records=%lu session=%lu seq=%lu state=%u warning=%u quality=%g pose_read=%u position_valid=0",
++				        d->stream_packets, d->stock_pose_packets, packet.session_id, packet.sequence,
++				        packet.tracking_state, packet.warning_flags, packet.pose_quality, packet.pose_read_status);
++		}
++		if (disconnected) {
++			close(fd); fd = -1; reset_stream_tracking(d);
++			U_LOG_I("A081 tracking stream disconnected; all pose validity cleared");
++		}
++	}
++	if (fd >= 0) close(fd);
++	reset_stream_tracking(d);
++	return NULL;
++}
++
++// Private SteamVR bridge reads one measured pose with its matching sample time.
++bool a081_qvr_latest_pose(struct xrt_device *xdev, struct xrt_space_relation *out, int64_t *sample_ns)
++{
++	struct a081 *d = (struct a081 *)xdev;
++	if (!d->stock_pose) return false;
++	memset(out, 0, sizeof(*out)); out->pose.orientation.w = 1;
++	pthread_mutex_lock(&d->mutex);
++	int64_t now = os_monotonic_get_ns();
++	int64_t age = now - d->fused_time_ns;
++	*sample_ns = now;
++	if (atomic_load(&d->running) && age >= 0 && age < 100000000) {
++		*out = d->stock_relation;
++		*sample_ns = d->fused_time_ns;
++	}
++	pthread_mutex_unlock(&d->mutex);
++	return true;
++}
++
++static xrt_result_t get_pose(struct xrt_device *xdev, enum xrt_input_name name, int64_t at, struct xrt_space_relation *out)
++{
++	(void)at; // No prediction until the board's IMU-to-eye transform is verified.
++	struct a081 *d = (struct a081 *)xdev;
++	if (name != XRT_INPUT_GENERIC_HEAD_POSE) return XRT_ERROR_INPUT_UNSUPPORTED;
++	memset(out, 0, sizeof(*out)); out->pose.orientation.w = 1;
++	pthread_mutex_lock(&d->mutex);
++	int64_t age = os_monotonic_get_ns() - d->fused_time_ns;
++	if (d->stock_pose) {
++		if (atomic_load(&d->running) && age >= 0 && age < 100000000) *out = d->stock_relation;
++		pthread_mutex_unlock(&d->mutex);
++		return XRT_SUCCESS;
++	}
++	bool warmed_up = !d->stock_stream || (d->stream_start_ns && d->fused_time_ns - d->stream_start_ns >= 300000000);
++	if (atomic_load(&d->running) && d->fused_samples >= 30 && warmed_up && age >= 0 && age < 100000000) {
++		out->pose.orientation = d->fusion.rot;
++		out->relation_flags = XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT;
++	}
++	pthread_mutex_unlock(&d->mutex);
++	return XRT_SUCCESS;
++}
++
++static xrt_result_t get_views(struct xrt_device *d, const struct xrt_vec3 *eye_relation, int64_t at,
++                     enum xrt_view_type view_type, uint32_t count,
++                     struct xrt_space_relation *head, struct xrt_fov *fovs, struct xrt_pose *poses)
++{
++	(void)eye_relation;
++	const struct xrt_vec3 calibrated_ipd = {0.0634f, 0, 0}; // Stock svrapi_config, not a measured current IPD.
++	return u_device_get_view_poses(d, &calibrated_ipd, at, view_type, count, head, fovs, poses);
++}
++
++static void destroy(struct xrt_device *xdev)
++{
++	struct a081 *d = (struct a081 *)xdev;
++	atomic_store(&d->running, false);
++	if (d->started) pthread_join(d->thread, NULL);
++	U_LOG_I("A081 stopped: real accel=%lu gyro=%lu fused=%lu", d->accel.samples, d->gyro.samples, d->fused_samples);
++	if (d->stock_stream) U_LOG_I("A081 stream stopped: packets=%lu raw_pose_records=%lu", d->stream_packets, d->stock_pose_packets);
++	close_stream(&d->gyro); close_stream(&d->accel);
++	if (d->lock_fd >= 0) close(d->lock_fd);
++	m_imu_3dof_close(&d->fusion);
++	pthread_mutex_destroy(&d->mutex);
++	u_device_free(xdev);
++}
++
++bool a081_present(void)
++{
++	char model[128];
++	return read_text("/proc/device-tree/model", model, sizeof(model)) && strstr(model, "A081");
++}
++
++struct xrt_device *a081_create(void)
++{
++	if (!a081_present() || !getenv("A081_BRINGUP") || strcmp(getenv("A081_BRINGUP"), "1")) {
++		U_LOG_E("A081 real hardware and explicit A081_BRINGUP=1 required"); return NULL;
++	}
++	struct a081 *d = U_DEVICE_ALLOCATE(struct a081, U_DEVICE_ALLOC_HMD | U_DEVICE_ALLOC_TRACKING_NONE, 1, 0);
++	d->accel.fd = d->gyro.fd = d->lock_fd = -1;
++	atomic_init(&d->running, false);
++	pthread_mutex_init(&d->mutex, NULL);
++	m_imu_3dof_init(&d->fusion, M_IMU_3DOF_USE_GRAVITY_DUR_300MS);
++	const char *source = getenv("A081_TRACKING_SOURCE");
++	if (source && strcmp(source, "iio") && strcmp(source, "qvr-stream") && strcmp(source, "qvr-pose")) {
++		U_LOG_E("A081_TRACKING_SOURCE must be iio, qvr-stream or qvr-pose"); destroy(&d->base); return NULL;
++	}
++	d->stock_pose = source && !strcmp(source, "qvr-pose");
++	d->stock_stream = d->stock_pose || (source && !strcmp(source, "qvr-stream"));
++	if (d->stock_pose) {
++		const char *profile = getenv("A081_QVR_POSE_PROFILE");
++		if (!profile || strcmp(profile, "android-portrait-v1")) {
++			U_LOG_E("qvr-pose requires explicit A081_QVR_POSE_PROFILE=android-portrait-v1");
++			destroy(&d->base); return NULL;
++		}
++	}
++	if (d->stock_stream) {
++		const char *path = getenv("A081_QVR_TRACKING_SOCKET");
++		if (!path || path[0] != '/' || strlen(path) >= sizeof(d->tracking_socket)) {
++			U_LOG_E("qvr-stream requires an absolute A081_QVR_TRACKING_SOCKET"); destroy(&d->base); return NULL;
++		}
++		strcpy(d->tracking_socket, path);
++	} else {
++		// Share the same global ownership lock with the original-DSP producer.
++		d->lock_fd = open("/run/a081-iio.lock", O_CREAT | O_RDWR | O_CLOEXEC, 0600);
++		if (d->lock_fd < 0 || flock(d->lock_fd, LOCK_EX | LOCK_NB) ||
++		    !open_stream(&d->accel, "qcom-see-accel", "accel") || !open_stream(&d->gyro, "qcom-see-gyro", "anglvel")) {
++			U_LOG_E("A081 IIO open failed: %s", strerror(errno)); destroy(&d->base); return NULL;
++		}
++	}
++	struct xrt_device *xdev = &d->base;
++	xdev->name = XRT_DEVICE_GENERIC_HMD; xdev->device_type = XRT_DEVICE_TYPE_HMD;
++	snprintf(xdev->str, sizeof(xdev->str), "Qiyu MIX A081 %s (uncalibrated)", d->stock_pose ? "QVR experimental 6DoF" : d->stock_stream ? "QVR input 3DoF" : "real IIO 3DoF");
++	snprintf(xdev->serial, sizeof(xdev->serial), "A081-LINUX-IIO");
++	xdev->inputs[0].name = XRT_INPUT_GENERIC_HEAD_POSE;
++	xdev->supported.orientation_tracking = true; xdev->supported.position_tracking = d->stock_pose;
++	xdev->tracking_origin->type = XRT_TRACKING_TYPE_OTHER;
++	xdev->update_inputs = u_device_noop_update_inputs;
++	xdev->get_tracked_pose = get_pose; xdev->get_view_poses = get_views;
++	xdev->get_visibility_mask = u_device_get_visibility_mask; xdev->destroy = destroy;
++	xdev->hmd->view_count = 2;
++	xdev->hmd->blend_modes[0] = XRT_BLEND_MODE_OPAQUE;
++	xdev->hmd->blend_mode_count = 1;
++	xdev->hmd->screens[0].w_pixels = 1920; xdev->hmd->screens[0].h_pixels = 3664;
++	xdev->hmd->screens[0].nominal_frame_interval_ns = 1000000000 / 72;
++	for (unsigned i = 0; i < 2; i++) {
++		xdev->hmd->views[i].display.w_pixels = 1832; xdev->hmd->views[i].display.h_pixels = 1920;
++		xdev->hmd->views[i].viewport.x_pixels = 0; xdev->hmd->views[i].viewport.y_pixels = 1832 * i;
++		xdev->hmd->views[i].viewport.w_pixels = 1920; xdev->hmd->views[i].viewport.h_pixels = 1832;
++		xdev->hmd->views[i].rot = u_device_rotation_right;
++		xdev->hmd->distortion.fov[i] = (struct xrt_fov){-atanf(.0609f/.0578449f), atanf(.0609f/.0578449f),
++		                                                        atanf(.068f/.0578449f), -atanf(.068f/.0578449f)};
++	}
++	a081_setup_optics(xdev);
++	U_LOG_I("A081 stock optical map: display FOV, RGB polynomial, panel overscan scale; physical acceptance pending");
++	if (d->stock_pose)
++		U_LOG_W("A081 experimental QVR pose: SDK android-portrait-v1, raw tracker origin (IMU-reference assumed), metric scale from factory calibration; physical axes/scale/eye offset/accuracy uncalibrated; no prediction or controllers");
++	else
++		U_LOG_W("A081 bring-up: source=%s; real IMU 3DoF, provisional optics, NO position or controllers", d->stock_stream ? "qvr-stream" : "iio");
++	atomic_store(&d->running, true);
++	if (pthread_create(&d->thread, NULL, d->stock_stream ? read_tracking_stream : read_imu, d)) { destroy(xdev); return NULL; }
++	d->started = true;
++	return xdev;
++}
+--- /dev/null
++++ b/src/xrt/targets/common/a081_optics.h
+@@ -0,0 +1,45 @@
++// SPDX-License-Identifier: BSL-1.0
++// A081 stock optical profile. See profile.json for provenance and limits.
++#pragma once
++
++#include "xrt/xrt_device.h"
++#include <math.h>
++
++static xrt_result_t
++a081_compute_distortion(struct xrt_device *xdev, uint32_t view, float u, float v,
++                        struct xrt_uv_triplet *out)
++{
++	(void)xdev;
++	if (view >= 2 || !isfinite(u) || !isfinite(v)) {
++		return XRT_ERROR_DEVICE_CREATION_FAILED;
++	}
++	// The caller has already rotated panel coordinates into the upright eye.
++	// SXR builds an oversize mesh with position +/-FrustumDisplay/Display,
++	// while its base texture coordinates span [0,1]. Evaluate that mesh at
++	// the actual panel position, not at its overscan boundary.
++	const float x = 2.0f * u - 1.0f;
++	const float y = 2.0f * v - 1.0f;
++	const float scale_x = 41.2f / 30.0906f;
++	const float scale_y = 45.8f / 31.536f;
++	// GenerateWarpCoords' samplePoint branch uses width/4 as focal length
++	// in pixels, with width=3664 and height=1920 BEFORE panel rotation.
++	const float aspect = 1920.0f / 1832.0f;
++	const float r2 = x * x + y * y * aspect * aspect;
++	const float radial = 1.0f + r2 * (0.218861984f + r2 * (-0.026857263f + r2 * 0.178005457f));
++	const float sx = x * radial / scale_x;
++	const float sy = y * radial / scale_y;
++	out->r = (struct xrt_vec2){0.5f + 0.5f * sx * 0.9965f, 0.5f + 0.5f * sy * 0.9965f};
++	out->g = (struct xrt_vec2){0.5f + 0.5f * sx, 0.5f + 0.5f * sy};
++	out->b = (struct xrt_vec2){0.5f + 0.5f * sx * 1.0040f, 0.5f + 0.5f * sy * 1.0040f};
++	// Keep out-of-image UVs: the compositor must show the black border,
++	// rather than stretching the last texel across the lens periphery.
++	return XRT_SUCCESS;
++}
++
++static void
++a081_setup_optics(struct xrt_device *xdev)
++{
++	xdev->compute_distortion = a081_compute_distortion;
++	xdev->hmd->distortion.models = XRT_DISTORTION_MODEL_COMPUTE;
++	xdev->hmd->distortion.preferred = XRT_DISTORTION_MODEL_COMPUTE;
++}
+--- /dev/null
++++ b/src/xrt/targets/common/target_builder_a081.c
+@@ -0,0 +1,39 @@
++// SPDX-License-Identifier: BSL-1.0
++#include "xrt/xrt_device.h"
++#include "xrt/xrt_prober.h"
++#include "xrt/xrt_system.h"
++#include "util/u_misc.h"
++#include "target_builder_helpers.h"
++#include <stdlib.h>
++
++extern bool a081_present(void);
++extern struct xrt_device *a081_create(void);
++static const char *drivers[] = {"a081"};
++
++static xrt_result_t estimate(struct xrt_builder *b, cJSON *c, struct xrt_prober *p, struct xrt_builder_estimate *e)
++{
++	(void)b; (void)c; (void)p;
++	e->certain.head = a081_present(); e->priority = 100;
++	return XRT_SUCCESS;
++}
++static xrt_result_t open_system(struct xrt_builder *b, cJSON *c, struct xrt_prober *p,
++    struct xrt_tracking_origin *o, struct xrt_system_devices *s, struct xrt_frame_context *f,
++    struct t_builder_roles_helper *roles)
++{
++	(void)b; (void)c; (void)p; (void)o; (void)f;
++	struct xrt_device *head = a081_create();
++	if (!head) return XRT_ERROR_DEVICE_CREATION_FAILED;
++	s->static_xdevs[s->static_xdev_count++] = head;
++	roles->head = head;
++	return XRT_SUCCESS;
++}
++static void destroy_builder(struct xrt_builder *b) { free(b); }
++struct xrt_builder *t_builder_a081_create(void)
++{
++	struct t_builder *b = U_TYPED_CALLOC(struct t_builder);
++	b->base.estimate_system = estimate; b->base.open_system = t_builder_open_system_static_roles;
++	b->base.destroy = destroy_builder; b->base.identifier = "a081"; b->base.name = "A081 Linux IIO";
++	b->base.driver_identifiers = drivers; b->base.driver_identifier_count = 1;
++	b->open_system_static_roles = open_system;
++	return &b->base;
++}
+--- a/src/xrt/targets/common/target_lists.c
++++ b/src/xrt/targets/common/target_lists.c
+@@ -119,7 +119,9 @@
+ /*!
+  * Builders
+  */
++struct xrt_builder *t_builder_a081_create(void);
+ xrt_builder_create_func_t target_builder_list[] = {
++    t_builder_a081_create,
+ #ifdef T_BUILDER_QWERTY // High up to override any real hardware.
+     t_builder_qwerty_create,
+ #endif // T_BUILDER_QWERTY
+--- a/src/xrt/targets/steamvr_drv/CMakeLists.txt
++++ b/src/xrt/targets/steamvr_drv/CMakeLists.txt
+@@ -52,7 +52,9 @@
+ 		set(PLUGINDIR "${PROJECT_BINARY_DIR}/steamvr-monado/bin/osx32")
+ 	endif()
+ elseif(NOT ANDROID)
+-	if("${CMAKE_SIZEOF_VOID_P}" EQUAL "8")
++	if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
++		set(PLUGINDIR "${PROJECT_BINARY_DIR}/steamvr-monado/bin/linuxarm64")
++	elseif("${CMAKE_SIZEOF_VOID_P}" EQUAL "8")
+ 		set(PLUGINDIR "${PROJECT_BINARY_DIR}/steamvr-monado/bin/linux64")
+ 	else()
+ 		set(PLUGINDIR "${PROJECT_BINARY_DIR}/steamvr-monado/bin/linux32")

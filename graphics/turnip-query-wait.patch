@@ -1,0 +1,21 @@
+--- a/src/freedreno/vulkan/tu_query_pool.cc
++++ b/src/freedreno/vulkan/tu_query_pool.cc
+@@ -621,12 +621,18 @@
+    /* TODO: Use the MSM_IOVA_WAIT ioctl to wait on the available bit in a
+     * scheduler friendly way instead of busy polling once the patch has landed
+     * upstream. */
++   /* Optional bounded sleep reduces CPU polling without publishing an
++    * unavailable result. Zero retains the original busy-wait behavior. */
++   static const int sleep_us = CLAMP(
++      debug_get_num_option("TU_A081_QUERY_SLEEP_US", 0), 0, 1000);
+    struct query_slot *slot = slot_address(pool, query);
+    uint64_t abs_timeout = os_time_get_absolute_timeout(
+          WAIT_TIMEOUT * NSEC_PER_SEC);
+    while(os_time_get_nano() < abs_timeout) {
+       if (query_is_available(slot))
+          return VK_SUCCESS;
++      if (sleep_us)
++         os_time_sleep(sleep_us);
+    }
+    return vk_error(device, VK_TIMEOUT);
+ }
